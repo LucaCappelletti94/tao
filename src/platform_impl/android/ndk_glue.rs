@@ -250,18 +250,32 @@ fn activity_id(env: &mut JNIEnv<'_>, activity: &JObject<'_>) -> ActivityId {
     .unwrap()
 }
 
+fn register_activity_context(
+  contexts: &mut BTreeMap<ActivityId, AndroidContext>,
+  activity_id: ActivityId,
+  mut context: AndroidContext,
+) {
+  context.window_created = contexts
+    .get(&activity_id)
+    .is_some_and(|ctx| ctx.window_created);
+  contexts.insert(activity_id, context);
+}
+
 pub fn main_android_context() -> Option<AndroidContext> {
   CONTEXTS.lock().unwrap().values().next().cloned()
 }
 
+/// Claims the next `Activity` without a Rust window.
 pub fn next_available_activity() -> Option<(ActivityId, AndroidContext)> {
   CONTEXTS
     .lock()
     .unwrap()
-    .iter()
-    .filter(|(_, ctx)| !ctx.window_created)
-    .next()
-    .map(|(id, ctx)| (*id, ctx.clone()))
+    .iter_mut()
+    .find(|(_, ctx)| !ctx.window_created)
+    .map(|(id, ctx)| {
+      ctx.window_created = true;
+      (*id, ctx.clone())
+    })
 }
 
 pub static PIPE: LazyLock<[OwnedFd; 2]> = LazyLock::new(|| {
@@ -449,7 +463,8 @@ pub unsafe fn onCreate(
   let activity = env.new_global_ref(activity).unwrap();
   let thread_env = vm.attach_current_thread_as_daemon().unwrap();
 
-  CONTEXTS.lock().unwrap().insert(
+  register_activity_context(
+    &mut CONTEXTS.lock().unwrap(),
     activity_id,
     AndroidContext {
       java_vm: vm.get_java_vm_pointer() as *mut _,
@@ -800,3 +815,54 @@ unsafe extern "C" fn on_content_rect_changed(activity: *mut ANativeActivity, rec
   wake(activity, Event::ContentRectChanged);
 }
 */
+
+#[cfg(test)]
+mod tests {
+  use super::{
+    next_available_activity, register_activity_context, ActivityId, AndroidContext, BTreeMap,
+    CONTEXTS,
+  };
+
+  struct RestoreContexts(BTreeMap<ActivityId, AndroidContext>);
+
+  impl Drop for RestoreContexts {
+    fn drop(&mut self) {
+      let mut contexts = match CONTEXTS.lock() {
+        Ok(contexts) => contexts,
+        Err(poisoned) => poisoned.into_inner(),
+      };
+      *contexts = std::mem::take(&mut self.0);
+    }
+  }
+
+  fn context(window_created: bool) -> AndroidContext {
+    AndroidContext {
+      java_vm: std::ptr::null_mut(),
+      context_jobject: std::ptr::null_mut(),
+      activity_name: String::new(),
+      window_created,
+    }
+  }
+
+  #[test]
+  fn available_activities_are_claimed_once() {
+    let _restore = {
+      let mut contexts = CONTEXTS.lock().unwrap();
+      let previous = std::mem::take(&mut *contexts);
+      for (id, window_created) in [(100, false), (101, true), (102, false)] {
+        contexts.insert(id, context(window_created));
+      }
+      RestoreContexts(previous)
+    };
+
+    assert_eq!(next_available_activity().unwrap().0, 100);
+    assert_eq!(next_available_activity().unwrap().0, 102);
+    assert!(next_available_activity().is_none());
+
+    register_activity_context(&mut CONTEXTS.lock().unwrap(), 100, context(false));
+    assert!(next_available_activity().is_none());
+    register_activity_context(&mut CONTEXTS.lock().unwrap(), 103, context(false));
+    assert_eq!(next_available_activity().unwrap().0, 103);
+    assert!(next_available_activity().is_none());
+  }
+}

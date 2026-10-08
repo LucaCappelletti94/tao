@@ -660,10 +660,20 @@ impl Window {
         let activity_id = ctx
           .create_activity(&activity_name)
           .map_err(|error| os_error!(OsError::JniCallError(error)))?;
+        {
+          let mut contexts = ndk_glue::CONTEXTS.lock().unwrap();
+          let ctx = contexts
+            .get_mut(&activity_id)
+            .ok_or_else(|| os_error!(OsError::NoAvailableActivity))?;
+          if ctx.window_created {
+            return Err(os_error!(OsError::NoAvailableActivity));
+          }
+          ctx.window_created = true;
+        }
         (activity_id, activity_name)
       }
       None => ndk_glue::next_available_activity()
-        .map(|(activity_id, ctx)| (activity_id, ctx.activity_name.clone()))
+        .map(|(activity_id, ctx)| (activity_id, ctx.activity_name))
         .ok_or_else(|| os_error!(OsError::NoAvailableActivity))?,
     };
     Ok(Self {
