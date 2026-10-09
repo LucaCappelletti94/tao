@@ -606,6 +606,10 @@ impl WindowBuilder {
   /// Builds the window.
   ///
   /// Possible causes of error include denied permission, incompatible system, and lack of memory.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Android:** Without `WindowBuilderExtAndroid::with_activity_name`, this claims the next unclaimed `Activity` and preserves the claim across configuration recreation.
   #[inline]
   pub fn build<T: 'static>(
     self,

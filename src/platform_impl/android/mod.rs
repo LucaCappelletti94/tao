@@ -662,8 +662,8 @@ impl Window {
           .map_err(|error| os_error!(OsError::JniCallError(error)))?;
         (activity_id, activity_name)
       }
-      None => ndk_glue::next_available_activity()
-        .map(|(activity_id, ctx)| (activity_id, ctx.activity_name.clone()))
+      None => ndk_glue::take_next_available_activity()
+        .map(|(activity_id, ctx)| (activity_id, ctx.activity_name))
         .ok_or_else(|| os_error!(OsError::NoAvailableActivity))?,
     };
     Ok(Self {

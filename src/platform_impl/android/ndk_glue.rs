@@ -19,7 +19,7 @@ use ndk::{
 };
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use std::{
-  collections::{BTreeMap, HashSet},
+  collections::{btree_map::Entry, BTreeMap, HashSet},
   ffi::{c_void, CStr, CString},
   fs::File,
   io::{BufRead, BufReader},
@@ -254,14 +254,32 @@ pub fn main_android_context() -> Option<AndroidContext> {
   CONTEXTS.lock().unwrap().values().next().cloned()
 }
 
-pub fn next_available_activity() -> Option<(ActivityId, AndroidContext)> {
-  CONTEXTS
-    .lock()
-    .unwrap()
-    .iter()
-    .filter(|(_, ctx)| !ctx.window_created)
-    .next()
-    .map(|(id, ctx)| (*id, ctx.clone()))
+pub fn take_next_available_activity() -> Option<(ActivityId, AndroidContext)> {
+  take_available_activity(&mut CONTEXTS.lock().unwrap())
+}
+
+fn take_available_activity(
+  contexts: &mut BTreeMap<ActivityId, AndroidContext>,
+) -> Option<(ActivityId, AndroidContext)> {
+  let (id, context) = contexts.iter_mut().find(|(_, ctx)| !ctx.window_created)?;
+  context.window_created = true;
+  Some((*id, context.clone()))
+}
+
+fn register_activity(
+  contexts: &mut BTreeMap<ActivityId, AndroidContext>,
+  activity_id: ActivityId,
+  mut context: AndroidContext,
+) {
+  match contexts.entry(activity_id) {
+    Entry::Vacant(entry) => {
+      entry.insert(context);
+    }
+    Entry::Occupied(mut entry) => {
+      context.window_created = entry.get().window_created;
+      entry.insert(context);
+    }
+  }
 }
 
 pub static PIPE: LazyLock<[OwnedFd; 2]> = LazyLock::new(|| {
@@ -449,7 +467,8 @@ pub unsafe fn onCreate(
   let activity = env.new_global_ref(activity).unwrap();
   let thread_env = vm.attach_current_thread_as_daemon().unwrap();
 
-  CONTEXTS.lock().unwrap().insert(
+  register_activity(
+    &mut CONTEXTS.lock().unwrap(),
     activity_id,
     AndroidContext {
       java_vm: vm.get_java_vm_pointer() as *mut _,
@@ -800,3 +819,57 @@ unsafe extern "C" fn on_content_rect_changed(activity: *mut ANativeActivity, rec
   wake(activity, Event::ContentRectChanged);
 }
 */
+
+#[cfg(test)]
+mod activity_claim_tests {
+  use super::*;
+
+  fn context() -> AndroidContext {
+    AndroidContext {
+      java_vm: std::ptr::null_mut(),
+      context_jobject: std::ptr::null_mut(),
+      activity_name: String::new(),
+      window_created: false,
+    }
+  }
+
+  #[test]
+  fn an_activity_can_only_be_claimed_once() {
+    let mut contexts = BTreeMap::new();
+    register_activity(&mut contexts, 0, context());
+    assert_eq!(
+      take_available_activity(&mut contexts).map(|(id, _)| id),
+      Some(0)
+    );
+    assert!(take_available_activity(&mut contexts).is_none());
+  }
+
+  #[test]
+  fn recreation_preserves_the_claim_during_replacement_overlap() {
+    let mut contexts = BTreeMap::new();
+    register_activity(&mut contexts, 0, context());
+    assert_eq!(
+      take_available_activity(&mut contexts).map(|(id, _)| id),
+      Some(0)
+    );
+    register_activity(&mut contexts, 0, context());
+    register_activity(&mut contexts, 1, context());
+    assert_eq!(
+      take_available_activity(&mut contexts).map(|(id, _)| id),
+      Some(1)
+    );
+    assert!(take_available_activity(&mut contexts).is_none());
+  }
+
+  #[test]
+  fn recreation_without_a_window_keeps_the_activity_available() {
+    let mut contexts = BTreeMap::new();
+    register_activity(&mut contexts, 0, context());
+    register_activity(&mut contexts, 0, context());
+    assert_eq!(
+      take_available_activity(&mut contexts).map(|(id, _)| id),
+      Some(0)
+    );
+    assert!(take_available_activity(&mut contexts).is_none());
+  }
+}
