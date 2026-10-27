@@ -9,16 +9,36 @@ pub mod prelude {
   pub use tao_macros::{android_fn, generate_package_name};
 }
 use crate::{
-  event_loop::{EventLoop, EventLoopWindowTarget},
+  event::Event,
+  event_loop::{ControlFlow, EventLoop, EventLoopWindowTarget},
   platform_impl::ndk_glue::Rect,
   window::{Window, WindowBuilder},
 };
 use ndk::configuration::Configuration;
 
 /// Additional methods on `EventLoop` that are specific to Android.
-pub trait EventLoopExtAndroid {}
+pub trait EventLoopExtAndroid {
+  /// A type provided by the user that can be passed through `Event::UserEvent`.
+  type UserEvent;
 
-impl<T> EventLoopExtAndroid for EventLoop<T> {}
+  /// Runs the event loop from callbacks on the calling thread's looper and returns at once, so the UI thread can run it where [`EventLoop::run`] would block, and `ControlFlow::ExitWithCode` exits the process as `run` does.
+  fn spawn<F>(self, event_handler: F)
+  where
+    F: 'static
+      + FnMut(Event<'_, Self::UserEvent>, &EventLoopWindowTarget<Self::UserEvent>, &mut ControlFlow);
+}
+
+impl<T> EventLoopExtAndroid for EventLoop<T> {
+  type UserEvent = T;
+
+  fn spawn<F>(self, event_handler: F)
+  where
+    F: 'static
+      + FnMut(Event<'_, Self::UserEvent>, &EventLoopWindowTarget<Self::UserEvent>, &mut ControlFlow),
+  {
+    self.event_loop.spawn(event_handler)
+  }
+}
 
 /// Additional methods on `EventLoopWindowTarget` that are specific to Android.
 pub trait EventLoopWindowTargetExtAndroid {}

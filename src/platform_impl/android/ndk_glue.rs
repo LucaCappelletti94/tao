@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::window::WindowId;
-use crossbeam_channel::Sender;
 pub use jni::{
   self,
   errors::Result as JniResult,
@@ -13,10 +12,7 @@ pub use jni::{
 };
 use log::Level;
 pub use ndk;
-use ndk::{
-  input_queue::InputQueue,
-  looper::{FdEvent, ForeignLooper, ThreadLooper},
-};
+use ndk::{input_queue::InputQueue, looper::ThreadLooper};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use std::{
   collections::{BTreeMap, HashSet},
@@ -24,9 +20,8 @@ use std::{
   fs::File,
   io::{BufRead, BufReader},
   os::unix::prelude::*,
-  sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, RwLock, RwLockReadGuard},
+  sync::{LazyLock, Mutex, OnceLock, RwLock, RwLockReadGuard},
   thread,
-  time::Duration,
 };
 
 /// Android pacakge name that could be used to reference classes
@@ -71,7 +66,7 @@ const DATA_URL_ENCODING_SET: &AsciiSet = &CONTROLS
 ///       - `private external fun onLowMemory()`
 ///       - `private external fun onNewIntent(intent: Intent)`
 /// 4. an on_activity_create function that will be ran once after the `onCreate` function above.
-/// 5. the main entry point of your android application that runs in `onFirstActivityCreate` after `onCreate` and `on_activity_create`.
+/// 5. the main entry point of your android application. It runs on the UI thread in `onFirstActivityCreate`, after `onCreate` and `on_activity_create`, and must return, so it starts the event loop with [`EventLoopExtAndroid::spawn`](crate::platform::android::EventLoopExtAndroid::spawn).
 #[rustfmt::skip]
 #[macro_export]
 macro_rules! android_binding {
@@ -115,10 +110,7 @@ macro_rules! android_binding {
   }};
 }
 
-/// `ndk-glue` macros register the reading end of an event pipe with the
-/// main [`ThreadLooper`] under this `ident`.
-/// When returned from [`ThreadLooper::poll_*`](ThreadLooper::poll_once)
-/// an event can be retrieved from [`poll_events()`].
+/// `ident` under which `run_return` polls the event pipe, whose events [`poll_events()`] reads.
 pub const NDK_GLUE_LOOPER_EVENT_PIPE_IDENT: i32 = 0;
 
 /// The [`InputQueue`] received from Android is registered with the main
@@ -186,19 +178,7 @@ impl AndroidContext {
       i
     )?;
 
-    let (tx, rx) = crossbeam_channel::bounded(1);
-    ACTIVITY_CREATED_SENDERS
-      .lock()
-      .unwrap()
-      .insert(activity_id, tx);
-    rx.recv_timeout(Duration::from_secs(5)).map_err(|e| {
-      log::error!("failed to create activity {activity_name}: {e}");
-      super::JniCallError::new(
-        jni::errors::Error::JniCall(jni::errors::JniError::Unknown),
-        Some(e.to_string()),
-      )
-    })?;
-
+    // The new activity's `onCreate` runs after this returns, reported by `WindowEvent::Started`.
     Ok(activity_id)
   }
 }
@@ -214,12 +194,9 @@ pub(crate) static CONTEXTS: LazyLock<Mutex<BTreeMap<ActivityId, AndroidContext>>
 static APPLICATION_CONTEXT: OnceLock<GlobalRef> = OnceLock::new();
 static WINDOW_MANAGER: LazyLock<Mutex<BTreeMap<ActivityId, GlobalRef>>> =
   LazyLock::new(Default::default);
-pub(crate) static ACTIVITY_CREATED_SENDERS: LazyLock<Mutex<BTreeMap<ActivityId, Sender<()>>>> =
-  LazyLock::new(Default::default);
 static INTENT_URLS: LazyLock<Mutex<Vec<url::Url>>> = LazyLock::new(Default::default);
 static INPUT_QUEUE: LazyLock<RwLock<Option<InputQueue>>> = LazyLock::new(Default::default);
 static CONTENT_RECT: LazyLock<RwLock<Rect>> = LazyLock::new(Default::default);
-static LOOPER: LazyLock<Mutex<Option<ForeignLooper>>> = LazyLock::new(Default::default);
 static RESUMED_ACTIVITIES: LazyLock<Mutex<HashSet<ActivityId>>> = LazyLock::new(Default::default);
 
 pub fn main_window_manager() -> Option<GlobalRef> {
@@ -264,9 +241,11 @@ pub fn next_available_activity() -> Option<(ActivityId, AndroidContext)> {
     .map(|(id, ctx)| (*id, ctx.clone()))
 }
 
+/// Lifecycle events for the event loop, non-blocking because the UI thread both writes and reads it.
 pub static PIPE: LazyLock<[OwnedFd; 2]> = LazyLock::new(|| {
   let mut pipe: [RawFd; 2] = Default::default();
-  unsafe { libc::pipe(pipe.as_mut_ptr()) };
+  let res = unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+  assert_eq!(res, 0, "pipe2 failed: {}", std::io::Error::last_os_error());
   pipe.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
 });
 
@@ -292,7 +271,13 @@ unsafe fn wake(event: Event) {
   log::trace!("{:?}", event);
   let size = std::mem::size_of::<Event>();
   let res = libc::write(PIPE[1].as_raw_fd(), &event as *const _ as *const _, size);
-  assert_eq!(res, size as libc::ssize_t);
+  if res != size as libc::ssize_t {
+    log::error!(
+      "dropped {:?}, the event pipe is full: {}",
+      event,
+      std::io::Error::last_os_error()
+    );
+  }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -354,36 +339,7 @@ pub unsafe fn onFirstActivityCreate(_env: JNIEnv, _: JClass, main: fn()) {
     }
   });
 
-  let looper_ready = Arc::new(Condvar::new());
-  let signal_looper_ready = looper_ready.clone();
-
-  thread::spawn(move || {
-    let looper = ThreadLooper::prepare();
-    let foreign = looper.into_foreign();
-    foreign
-      .add_fd(
-        PIPE[0].as_fd(),
-        NDK_GLUE_LOOPER_EVENT_PIPE_IDENT,
-        FdEvent::INPUT,
-        std::ptr::null_mut(),
-      )
-      .unwrap();
-
-    {
-      let mut locked_looper = LOOPER.lock().unwrap();
-      *locked_looper = Some(foreign);
-      signal_looper_ready.notify_one();
-    }
-
-    main();
-  });
-
-  // Don't return from this function (`ANativeActivity_onCreate`) until the thread
-  // has created its `ThreadLooper` and assigned it to the static `LOOPER` variable.
-  let locked_looper = LOOPER.lock().unwrap();
-  let _mutex_guard = looper_ready
-    .wait_while(locked_looper, |looper| looper.is_none())
-    .unwrap();
+  main();
 }
 
 #[allow(non_snake_case)]
@@ -460,14 +416,6 @@ pub unsafe fn onCreate(
   );
   let looper = ThreadLooper::for_thread().unwrap();
   setup(PACKAGE.get().unwrap(), thread_env, &looper, activity);
-
-  if let Some(tx) = ACTIVITY_CREATED_SENDERS
-    .lock()
-    .unwrap()
-    .remove(&activity_id)
-  {
-    let _ = tx.send(());
-  }
 
   handle_intent(env, intent);
 }

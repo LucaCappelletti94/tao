@@ -13,13 +13,16 @@ use crate::{
 use crossbeam_channel::{Receiver, Sender};
 use ndk::{
   configuration::Configuration,
-  looper::{ForeignLooper, Poll, ThreadLooper},
+  looper::{FdEvent, Poll, ThreadLooper},
 };
 use std::{
+  cell::RefCell,
   collections::{HashSet, VecDeque},
   error::Error,
   fmt,
-  sync::{LazyLock, RwLock},
+  os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+  rc::Rc,
+  sync::{Arc, LazyLock, RwLock},
   time::{Duration, Instant},
 };
 
@@ -147,16 +150,96 @@ enum EventSource {
   User,
 }
 
+/// `ident` of the user event [`WakeFd`] on the looper `run_return` polls.
+const USER_EVENT_IDENT: i32 = 2;
+
 fn poll(poll: Poll) -> Option<EventSource> {
   match poll {
     Poll::Event { ident, .. } => match ident {
       ndk_glue::NDK_GLUE_LOOPER_EVENT_PIPE_IDENT => Some(EventSource::Callback),
       ndk_glue::NDK_GLUE_LOOPER_INPUT_QUEUE_IDENT => Some(EventSource::InputQueue),
+      USER_EVENT_IDENT => Some(EventSource::User),
       _ => unreachable!(),
     },
     Poll::Timeout => None,
     Poll::Wake => Some(EventSource::User),
     Poll::Callback => unreachable!(),
+  }
+}
+
+/// Empties the counter of a non-blocking `eventfd` or `timerfd` and returns its value.
+fn reset_counter(fd: &OwnedFd) -> u64 {
+  let mut count = 0u64;
+  // An empty counter fails the read with `EAGAIN` and leaves `count` at 0.
+  unsafe { libc::read(fd.as_raw_fd(), (&mut count as *mut u64).cast(), 8) };
+  count
+}
+
+/// An `eventfd` that wakes the event loop for user events.
+struct WakeFd(OwnedFd);
+
+impl WakeFd {
+  fn new() -> Self {
+    let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    assert!(
+      fd >= 0,
+      "eventfd failed: {}",
+      std::io::Error::last_os_error()
+    );
+    Self(unsafe { OwnedFd::from_raw_fd(fd) })
+  }
+
+  fn wake(&self) {
+    let one = 1u64;
+    // A write fails only when the counter is full, and a full counter already wakes the loop.
+    unsafe { libc::write(self.0.as_raw_fd(), (&one as *const u64).cast(), 8) };
+  }
+}
+
+/// A `timerfd` that wakes the event loop for `ControlFlow::WaitUntil`.
+struct TimerFd(OwnedFd);
+
+impl TimerFd {
+  fn new() -> Self {
+    let fd = unsafe {
+      libc::timerfd_create(
+        libc::CLOCK_MONOTONIC,
+        libc::TFD_NONBLOCK | libc::TFD_CLOEXEC,
+      )
+    };
+    assert!(
+      fd >= 0,
+      "timerfd_create failed: {}",
+      std::io::Error::last_os_error()
+    );
+    Self(unsafe { OwnedFd::from_raw_fd(fd) })
+  }
+
+  /// Arms the timer to expire at `deadline`, or disarms it for `None`.
+  fn set(&self, deadline: Option<Instant>) {
+    // A zero `it_value` disarms the timer, so a deadline already passed waits 1 ns.
+    let value = deadline.map_or(Duration::ZERO, |deadline| {
+      deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_nanos(1))
+    });
+    let spec = libc::itimerspec {
+      it_interval: libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+      },
+      it_value: libc::timespec {
+        tv_sec: value.as_secs() as _,
+        tv_nsec: value.subsec_nanos() as _,
+      },
+    };
+    let res = unsafe { libc::timerfd_settime(self.0.as_raw_fd(), 0, &spec, std::ptr::null_mut()) };
+    assert_eq!(
+      res,
+      0,
+      "timerfd_settime failed: {}",
+      std::io::Error::last_os_error()
+    );
   }
 }
 
@@ -170,6 +253,7 @@ pub struct EventLoop<T: 'static> {
   first_event: Option<EventSource>,
   start_cause: event::StartCause,
   looper: ThreadLooper,
+  user_wake: Arc<WakeFd>,
   running: HashSet<window::WindowId>,
 }
 
@@ -191,7 +275,8 @@ impl<T: 'static> EventLoop<T> {
       receiver,
       first_event: None,
       start_cause: event::StartCause::Init,
-      looper: ThreadLooper::for_thread().unwrap(),
+      looper: ThreadLooper::for_thread().unwrap_or_else(ThreadLooper::prepare),
+      user_wake: Arc::new(WakeFd::new()),
       running: HashSet::new(),
     }
   }
@@ -212,255 +297,19 @@ impl<T: 'static> EventLoop<T> {
     let event_handler = &mut event_handler;
     let control_flow = &mut ControlFlow::default();
 
+    for (fd, ident) in self.polled_fds() {
+      self
+        .looper
+        .as_foreign()
+        .add_fd(fd, ident, FdEvent::INPUT, std::ptr::null_mut())
+        .expect(
+          "`run_return` needs a looper that accepts fds without callbacks, and the UI thread's \
+           looper does not. Use `EventLoopExtAndroid::spawn` there.",
+        );
+    }
+
     loop {
-      self.call_event_handler(
-        event_handler,
-        control_flow,
-        event::Event::NewEvents(self.start_cause),
-      );
-
-      let mut redraw_window_id = None;
-      let mut resized_window_id = None;
-
-      match self.first_event.take() {
-        Some(EventSource::Callback) => match ndk_glue::poll_events().unwrap() {
-          Event::Resume { id: window_id } => {
-            self.call_event_handler(
-              event_handler,
-              control_flow,
-              event::Event::WindowEvent {
-                window_id,
-                event: event::WindowEvent::Resumed,
-              },
-            );
-          }
-          Event::WindowEvent {
-            id: window_id,
-            event,
-          } => match event {
-            WindowEvent::Resized => resized_window_id = Some(window_id),
-            WindowEvent::RedrawNeeded => redraw_window_id = Some(window_id),
-            WindowEvent::Started => {
-              self.running.insert(window_id);
-              self.call_event_handler(
-                event_handler,
-                control_flow,
-                event::Event::WindowEvent {
-                  window_id,
-                  event: event::WindowEvent::Started,
-                },
-              );
-            }
-            WindowEvent::Focused(focused) => {
-              self.call_event_handler(
-                event_handler,
-                control_flow,
-                event::Event::WindowEvent {
-                  window_id,
-                  event: event::WindowEvent::Focused(focused),
-                },
-              );
-            }
-            WindowEvent::Stopped => {
-              self.running.remove(&window_id);
-              self.call_event_handler(
-                event_handler,
-                control_flow,
-                event::Event::WindowEvent {
-                  window_id,
-                  event: event::WindowEvent::Stopped,
-                },
-              );
-            }
-            WindowEvent::Destroyed => {
-              self.running.remove(&window_id);
-              self.call_event_handler(
-                event_handler,
-                control_flow,
-                event::Event::WindowEvent {
-                  window_id,
-                  event: event::WindowEvent::Destroyed,
-                },
-              );
-            }
-            _ => {}
-          },
-          Event::Pause { id: window_id } => {
-            self.call_event_handler(
-              event_handler,
-              control_flow,
-              event::Event::WindowEvent {
-                window_id,
-                event: event::WindowEvent::Suspended,
-              },
-            );
-          }
-          Event::Opened => {
-            let urls = ndk_glue::take_intent_urls();
-            if !urls.is_empty() {
-              self.call_event_handler(event_handler, control_flow, event::Event::Opened { urls });
-            }
-          }
-          //Event::ConfigChanged => {
-          // #[allow(deprecated)] // TODO: use ndk-context instead
-          // let am = ndk_glue::native_activity().asset_manager();
-          // let config = Configuration::from_asset_manager(&am);
-          // let old_scale_factor = MonitorHandle.scale_factor();
-          // *CONFIG.write().unwrap() = config;
-          // let scale_factor = MonitorHandle.scale_factor();
-          // if (scale_factor - old_scale_factor).abs() < f64::EPSILON {
-          //   let mut size = MonitorHandle.size();
-          //   let event = event::Event::WindowEvent {
-          //     window_id: window::WindowId(WindowId),
-          //     event: event::WindowEvent::ScaleFactorChanged {
-          //       new_inner_size: &mut size,
-          //       scale_factor,
-          //     },
-          //   };
-          //   self.call_event_handler(event_handler, control_flow, event);
-          // }
-          //}
-          _ => {}
-        },
-
-        Some(EventSource::InputQueue) => {
-          /*
-            if let Some(input_queue) = ndk_glue::input_queue().as_ref() {
-              while let Ok(Some(event)) = input_queue.event() {
-                if let Some(event) = input_queue.pre_dispatch(event) {
-                  let mut handled = true;
-                  let window_id = window::WindowId(WindowId);
-                  let device_id = event::DeviceId(DeviceId);
-                  match &event {
-                    InputEvent::MotionEvent(motion_event) => {
-                      let phase = match motion_event.action() {
-                        MotionAction::Down | MotionAction::PointerDown => {
-                          Some(event::TouchPhase::Started)
-                        }
-                        MotionAction::Up | MotionAction::PointerUp => Some(event::TouchPhase::Ended),
-                        MotionAction::Move => Some(event::TouchPhase::Moved),
-                        MotionAction::Cancel => Some(event::TouchPhase::Cancelled),
-                        _ => {
-                          handled = false;
-                          None // TODO mouse events
-                        }
-                      };
-                      if let Some(phase) = phase {
-                        let pointers: Box<dyn Iterator<Item = ndk::event::Pointer<'_>>> = match phase
-                        {
-                          event::TouchPhase::Started | event::TouchPhase::Ended => {
-                            Box::new(std::iter::once(
-                              motion_event.pointer_at_index(motion_event.pointer_index()),
-                            ))
-                          }
-                          event::TouchPhase::Moved | event::TouchPhase::Cancelled => {
-                            Box::new(motion_event.pointers())
-                          }
-                        };
-
-                        for pointer in pointers {
-                          let location = PhysicalPosition {
-                            x: pointer.x() as _,
-                            y: pointer.y() as _,
-                          };
-                          let event = event::Event::WindowEvent {
-                            window_id,
-                            event: event::WindowEvent::Touch(event::Touch {
-                              device_id,
-                              phase,
-                              location,
-                              id: pointer.pointer_id() as u64,
-                              force: None,
-                            }),
-                          };
-                          self.call_event_handler(
-                            event_handler,
-                            control_flow,
-                            event
-                          );
-                        }
-                      }
-                    }
-                    InputEvent::KeyEvent(key) => {
-                      let state = match key.action() {
-                        KeyAction::Down => event::ElementState::Pressed,
-                        KeyAction::Up => event::ElementState::Released,
-                        _ => event::ElementState::Released,
-                      };
-
-                      let keycode = key.key_code();
-                      let native = NativeKeyCode::Android(keycode.into());
-                      let physical_key = KeyCode::Unidentified(native);
-                      let logical_key = keycode_to_logical(keycode, native);
-                      // TODO: maybe use getUnicodeChar to get the logical key
-
-                      let event = event::Event::WindowEvent {
-                        window_id,
-                        event: event::WindowEvent::KeyboardInput {
-                          device_id,
-                          event: event::KeyEvent {
-                            state,
-                            physical_key,
-                            logical_key,
-                            location: keycode_to_location(keycode),
-                            repeat: key.repeat_count() > 0,
-                            text: None,
-                            platform_specific: KeyEventExtra {},
-                          },
-                          is_synthetic: false,
-                        },
-                      };
-                      self.call_event_handler(
-                        event_handler,
-                        control_flow,
-                        event,
-                      );
-                    }
-                    _ => {}
-                  };
-                  input_queue.finish_event(event, handled);
-                }
-              }
-            }
-          */
-        }
-        _ => {}
-      }
-
-      // We need to treat every event as if they were from [`EventLoopProxy::send_event`]
-      //
-      // > All return values may also imply ALOOPER_POLL_WAKE. If you call this in a loop,
-      // > you must treat all return values as if they also indicated ALOOPER_POLL_WAKE.
-      // > https://developer.android.com/ndk/reference/group/looper#alooper_pollonce
-      while let Ok(event) = self.receiver.try_recv() {
-        self.call_event_handler(event_handler, control_flow, event::Event::UserEvent(event));
-      }
-
-      self.call_event_handler(event_handler, control_flow, event::Event::MainEventsCleared);
-
-      if let Some(window_id) = resized_window_id {
-        if self.running.contains(&window_id) {
-          let size = MonitorHandle.size();
-          let event = event::Event::WindowEvent {
-            window_id,
-            event: event::WindowEvent::Resized(size),
-          };
-          self.call_event_handler(event_handler, control_flow, event);
-        }
-      }
-
-      if let Some(window_id) = redraw_window_id {
-        if self.running.contains(&window_id) {
-          let event = event::Event::RedrawRequested(window_id);
-          self.call_event_handler(event_handler, control_flow, event);
-        }
-      }
-
-      self.call_event_handler(
-        event_handler,
-        control_flow,
-        event::Event::RedrawEventsCleared,
-      );
+      self.single_iteration(event_handler, control_flow);
 
       match *control_flow {
         ControlFlow::ExitWithCode(code) => {
@@ -472,6 +321,9 @@ impl<T: 'static> EventLoop<T> {
 
           self.call_event_handler(event_handler, control_flow, event::Event::LoopDestroyed);
 
+          for (fd, _) in self.polled_fds() {
+            let _ = self.looper.as_foreign().remove_fd(fd);
+          }
           return code;
         }
         ControlFlow::Poll => {
@@ -509,6 +361,307 @@ impl<T: 'static> EventLoop<T> {
     }
   }
 
+  /// The fds `run_return` polls, with their `ident`.
+  fn polled_fds(&self) -> [(BorrowedFd<'_>, i32); 2] {
+    [
+      (
+        ndk_glue::PIPE[0].as_fd(),
+        ndk_glue::NDK_GLUE_LOOPER_EVENT_PIPE_IDENT,
+      ),
+      (self.user_wake.0.as_fd(), USER_EVENT_IDENT),
+    ]
+  }
+
+  pub fn spawn<F>(self, event_handler: F)
+  where
+    F:
+      'static + FnMut(event::Event<'_, T>, &event_loop::EventLoopWindowTarget<T>, &mut ControlFlow),
+  {
+    let runner = Rc::new(RefCell::new(Runner {
+      event_loop: self,
+      event_handler,
+      control_flow: ControlFlow::default(),
+      timer: TimerFd::new(),
+      waiting_since: None,
+    }));
+    let state = runner.borrow();
+    for (fd, wake) in [
+      (ndk_glue::PIPE[0].as_fd(), Wake::Lifecycle),
+      (state.event_loop.user_wake.0.as_fd(), Wake::User),
+      (state.timer.0.as_fd(), Wake::Timer),
+    ] {
+      let runner = Rc::clone(&runner);
+      state
+        .event_loop
+        .looper
+        .add_fd_with_callback(fd, FdEvent::INPUT, move |_, _| {
+          // A looper poll inside the handler re-enters here, and the readable fd waits a turn.
+          if let Ok(mut runner) = runner.try_borrow_mut() {
+            runner.run_once(wake);
+          }
+          true
+        })
+        .expect("failed to add an event loop fd to the looper");
+    }
+    // The first pass delivers `StartCause::Init`.
+    state.event_loop.user_wake.wake();
+  }
+
+  fn single_iteration<F>(&mut self, event_handler: &mut F, control_flow: &mut ControlFlow)
+  where
+    F: FnMut(event::Event<'_, T>, &event_loop::EventLoopWindowTarget<T>, &mut ControlFlow),
+  {
+    self.call_event_handler(
+      event_handler,
+      control_flow,
+      event::Event::NewEvents(self.start_cause),
+    );
+
+    let mut redraw_window_id = None;
+    let mut resized_window_id = None;
+
+    match self.first_event.take() {
+      Some(EventSource::Callback) => match ndk_glue::poll_events().unwrap() {
+        Event::Resume { id: window_id } => {
+          self.call_event_handler(
+            event_handler,
+            control_flow,
+            event::Event::WindowEvent {
+              window_id,
+              event: event::WindowEvent::Resumed,
+            },
+          );
+        }
+        Event::WindowEvent {
+          id: window_id,
+          event,
+        } => match event {
+          WindowEvent::Resized => resized_window_id = Some(window_id),
+          WindowEvent::RedrawNeeded => redraw_window_id = Some(window_id),
+          WindowEvent::Started => {
+            self.running.insert(window_id);
+            self.call_event_handler(
+              event_handler,
+              control_flow,
+              event::Event::WindowEvent {
+                window_id,
+                event: event::WindowEvent::Started,
+              },
+            );
+          }
+          WindowEvent::Focused(focused) => {
+            self.call_event_handler(
+              event_handler,
+              control_flow,
+              event::Event::WindowEvent {
+                window_id,
+                event: event::WindowEvent::Focused(focused),
+              },
+            );
+          }
+          WindowEvent::Stopped => {
+            self.running.remove(&window_id);
+            self.call_event_handler(
+              event_handler,
+              control_flow,
+              event::Event::WindowEvent {
+                window_id,
+                event: event::WindowEvent::Stopped,
+              },
+            );
+          }
+          WindowEvent::Destroyed => {
+            self.running.remove(&window_id);
+            self.call_event_handler(
+              event_handler,
+              control_flow,
+              event::Event::WindowEvent {
+                window_id,
+                event: event::WindowEvent::Destroyed,
+              },
+            );
+          }
+          _ => {}
+        },
+        Event::Pause { id: window_id } => {
+          self.call_event_handler(
+            event_handler,
+            control_flow,
+            event::Event::WindowEvent {
+              window_id,
+              event: event::WindowEvent::Suspended,
+            },
+          );
+        }
+        Event::Opened => {
+          let urls = ndk_glue::take_intent_urls();
+          if !urls.is_empty() {
+            self.call_event_handler(event_handler, control_flow, event::Event::Opened { urls });
+          }
+        }
+        //Event::ConfigChanged => {
+        // #[allow(deprecated)] // TODO: use ndk-context instead
+        // let am = ndk_glue::native_activity().asset_manager();
+        // let config = Configuration::from_asset_manager(&am);
+        // let old_scale_factor = MonitorHandle.scale_factor();
+        // *CONFIG.write().unwrap() = config;
+        // let scale_factor = MonitorHandle.scale_factor();
+        // if (scale_factor - old_scale_factor).abs() < f64::EPSILON {
+        //   let mut size = MonitorHandle.size();
+        //   let event = event::Event::WindowEvent {
+        //     window_id: window::WindowId(WindowId),
+        //     event: event::WindowEvent::ScaleFactorChanged {
+        //       new_inner_size: &mut size,
+        //       scale_factor,
+        //     },
+        //   };
+        //   self.call_event_handler(event_handler, control_flow, event);
+        // }
+        //}
+        _ => {}
+      },
+
+      Some(EventSource::InputQueue) => {
+        /*
+          if let Some(input_queue) = ndk_glue::input_queue().as_ref() {
+            while let Ok(Some(event)) = input_queue.event() {
+              if let Some(event) = input_queue.pre_dispatch(event) {
+                let mut handled = true;
+                let window_id = window::WindowId(WindowId);
+                let device_id = event::DeviceId(DeviceId);
+                match &event {
+                  InputEvent::MotionEvent(motion_event) => {
+                    let phase = match motion_event.action() {
+                      MotionAction::Down | MotionAction::PointerDown => {
+                        Some(event::TouchPhase::Started)
+                      }
+                      MotionAction::Up | MotionAction::PointerUp => Some(event::TouchPhase::Ended),
+                      MotionAction::Move => Some(event::TouchPhase::Moved),
+                      MotionAction::Cancel => Some(event::TouchPhase::Cancelled),
+                      _ => {
+                        handled = false;
+                        None // TODO mouse events
+                      }
+                    };
+                    if let Some(phase) = phase {
+                      let pointers: Box<dyn Iterator<Item = ndk::event::Pointer<'_>>> = match phase
+                      {
+                        event::TouchPhase::Started | event::TouchPhase::Ended => {
+                          Box::new(std::iter::once(
+                            motion_event.pointer_at_index(motion_event.pointer_index()),
+                          ))
+                        }
+                        event::TouchPhase::Moved | event::TouchPhase::Cancelled => {
+                          Box::new(motion_event.pointers())
+                        }
+                      };
+
+                      for pointer in pointers {
+                        let location = PhysicalPosition {
+                          x: pointer.x() as _,
+                          y: pointer.y() as _,
+                        };
+                        let event = event::Event::WindowEvent {
+                          window_id,
+                          event: event::WindowEvent::Touch(event::Touch {
+                            device_id,
+                            phase,
+                            location,
+                            id: pointer.pointer_id() as u64,
+                            force: None,
+                          }),
+                        };
+                        self.call_event_handler(
+                          event_handler,
+                          control_flow,
+                          event
+                        );
+                      }
+                    }
+                  }
+                  InputEvent::KeyEvent(key) => {
+                    let state = match key.action() {
+                      KeyAction::Down => event::ElementState::Pressed,
+                      KeyAction::Up => event::ElementState::Released,
+                      _ => event::ElementState::Released,
+                    };
+
+                    let keycode = key.key_code();
+                    let native = NativeKeyCode::Android(keycode.into());
+                    let physical_key = KeyCode::Unidentified(native);
+                    let logical_key = keycode_to_logical(keycode, native);
+                    // TODO: maybe use getUnicodeChar to get the logical key
+
+                    let event = event::Event::WindowEvent {
+                      window_id,
+                      event: event::WindowEvent::KeyboardInput {
+                        device_id,
+                        event: event::KeyEvent {
+                          state,
+                          physical_key,
+                          logical_key,
+                          location: keycode_to_location(keycode),
+                          repeat: key.repeat_count() > 0,
+                          text: None,
+                          platform_specific: KeyEventExtra {},
+                        },
+                        is_synthetic: false,
+                      },
+                    };
+                    self.call_event_handler(
+                      event_handler,
+                      control_flow,
+                      event,
+                    );
+                  }
+                  _ => {}
+                };
+                input_queue.finish_event(event, handled);
+              }
+            }
+          }
+        */
+      }
+      _ => {}
+    }
+
+    reset_counter(&self.user_wake.0);
+    // We need to treat every event as if they were from [`EventLoopProxy::send_event`]
+    //
+    // > All return values may also imply ALOOPER_POLL_WAKE. If you call this in a loop,
+    // > you must treat all return values as if they also indicated ALOOPER_POLL_WAKE.
+    // > https://developer.android.com/ndk/reference/group/looper#alooper_pollonce
+    while let Ok(event) = self.receiver.try_recv() {
+      self.call_event_handler(event_handler, control_flow, event::Event::UserEvent(event));
+    }
+
+    self.call_event_handler(event_handler, control_flow, event::Event::MainEventsCleared);
+
+    if let Some(window_id) = resized_window_id {
+      if self.running.contains(&window_id) {
+        let size = MonitorHandle.size();
+        let event = event::Event::WindowEvent {
+          window_id,
+          event: event::WindowEvent::Resized(size),
+        };
+        self.call_event_handler(event_handler, control_flow, event);
+      }
+    }
+
+    if let Some(window_id) = redraw_window_id {
+      if self.running.contains(&window_id) {
+        let event = event::Event::RedrawRequested(window_id);
+        self.call_event_handler(event_handler, control_flow, event);
+      }
+    }
+
+    self.call_event_handler(
+      event_handler,
+      control_flow,
+      event::Event::RedrawEventsCleared,
+    );
+  }
+
   fn call_event_handler<F>(
     &self,
     event_handler: &mut F,
@@ -535,20 +688,98 @@ impl<T: 'static> EventLoop<T> {
   pub fn create_proxy(&self) -> EventLoopProxy<T> {
     EventLoopProxy {
       queue: self.sender_to_clone.clone(),
-      looper: ForeignLooper::for_thread().expect("called from event loop thread"),
+      wake: Arc::clone(&self.user_wake),
     }
+  }
+}
+
+/// What made the looper call the event loop back.
+#[derive(Clone, Copy)]
+enum Wake {
+  Lifecycle,
+  User,
+  Timer,
+}
+
+/// The event loop state `EventLoop::spawn` hands to the looper callbacks.
+struct Runner<T: 'static, F> {
+  event_loop: EventLoop<T>,
+  event_handler: F,
+  control_flow: ControlFlow,
+  timer: TimerFd,
+  /// When the loop last went idle, `None` before the first pass.
+  waiting_since: Option<Instant>,
+}
+
+impl<T: 'static, F> Runner<T, F>
+where
+  F: FnMut(event::Event<'_, T>, &event_loop::EventLoopWindowTarget<T>, &mut ControlFlow),
+{
+  /// Runs one pass of the event loop, then sets up the wake its `ControlFlow` asks for.
+  fn run_once(&mut self, wake: Wake) {
+    let (source, counter) = match wake {
+      Wake::Lifecycle => (Some(EventSource::Callback), None),
+      Wake::User => (Some(EventSource::User), Some(&self.event_loop.user_wake.0)),
+      Wake::Timer => (None, Some(&self.timer.0)),
+    };
+    // An earlier pass in the same looper turn can empty the user counter or rearm the timer.
+    if counter.is_some_and(|fd| reset_counter(fd) == 0) {
+      return;
+    }
+    self.event_loop.start_cause = match (self.waiting_since, self.control_flow) {
+      (None, _) => event::StartCause::Init,
+      (Some(_), ControlFlow::Poll) => event::StartCause::Poll,
+      (Some(start), ControlFlow::Wait) => event::StartCause::WaitCancelled {
+        start,
+        requested_resume: None,
+      },
+      (Some(start), ControlFlow::WaitUntil(requested_resume)) => match wake {
+        Wake::Timer => event::StartCause::ResumeTimeReached {
+          start,
+          requested_resume,
+        },
+        Wake::Lifecycle | Wake::User => event::StartCause::WaitCancelled {
+          start,
+          requested_resume: Some(requested_resume),
+        },
+      },
+      (Some(_), ControlFlow::ExitWithCode(_)) => unreachable!("the process exits with the loop"),
+    };
+    self.event_loop.first_event = source;
+
+    self
+      .event_loop
+      .single_iteration(&mut self.event_handler, &mut self.control_flow);
+
+    match self.control_flow {
+      ControlFlow::ExitWithCode(code) => {
+        self.event_loop.call_event_handler(
+          &mut self.event_handler,
+          &mut self.control_flow,
+          event::Event::LoopDestroyed,
+        );
+        std::process::exit(code);
+      }
+      ControlFlow::Poll => {
+        self.timer.set(None);
+        self.event_loop.user_wake.wake();
+      }
+      ControlFlow::Wait => self.timer.set(None),
+      ControlFlow::WaitUntil(deadline) => self.timer.set(Some(deadline)),
+    }
+    self.waiting_since = Some(Instant::now());
   }
 }
 
 pub struct EventLoopProxy<T: 'static> {
   queue: Sender<T>,
-  looper: ForeignLooper,
+  wake: Arc<WakeFd>,
 }
 
 impl<T> EventLoopProxy<T> {
   pub fn send_event(&self, event: T) -> Result<(), event_loop::EventLoopClosed<T>> {
     let _ = self.queue.send(event);
-    self.looper.wake();
+    self.wake.wake();
     Ok(())
   }
 }
@@ -557,7 +788,7 @@ impl<T> Clone for EventLoopProxy<T> {
   fn clone(&self) -> Self {
     EventLoopProxy {
       queue: self.queue.clone(),
-      looper: self.looper.clone(),
+      wake: Arc::clone(&self.wake),
     }
   }
 }
